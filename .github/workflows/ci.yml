@@ -1,4 +1,4 @@
-name: Blacksmith CI
+name: CI
 
 on:
   push:
@@ -6,24 +6,23 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - uses: useblacksmith/cache@v5
-        with:
-          path: |
-            node_modules
-            ~/.npm
-          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
-          restore-keys: ${{ runner.os }}-npm-
+      # Ubuntu 24.04 includes Node 22; reject a changed image default.
+      - name: Verify Node 22
+        run: |
+          node -e 'if (process.versions.node.split(".")[0] !== "22") throw new Error("CI requires Node 22")'
+          node --version
+          npm --version
 
       - run: npm ci
       - run: npm run build
-      - run: npm test --if-present || echo "no tests configured"
+      - run: npm test
