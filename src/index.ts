@@ -12,6 +12,12 @@ interface Facet {
   features: Array<{ $type: string; [key: string]: unknown }>;
 }
 
+function utf8ByteSpan(text: string, charStart: number, charLength: number): { byteStart: number; byteEnd: number } {
+  const byteStart = Buffer.byteLength(text.slice(0, charStart), "utf8");
+  const byteEnd = byteStart + Buffer.byteLength(text.slice(charStart, charStart + charLength), "utf8");
+  return { byteStart, byteEnd };
+}
+
 function detectFacets(text: string): Facet[] {
   const facets: Facet[] = [];
 
@@ -20,17 +26,18 @@ function detectFacets(text: string): Facet[] {
   let match: RegExpExecArray | null;
   while ((match = mentionRe.exec(text)) !== null) {
     facets.push({
-      index: { byteStart: match.index, byteEnd: match.index + match[0].length },
+      index: utf8ByteSpan(text, match.index, match[0].length),
       features: [{ $type: "app.bsky.richtext.facet#mention", did: match[1] }],
     });
   }
 
-  // Links
-  const linkRe = /(https?:\/\/[^\s]+)/g;
+  // Links (strip trailing sentence punctuation)
+  const linkRe = /(https?:\/\/[^\s)\]>,"']+)/g;
   while ((match = linkRe.exec(text)) !== null) {
+    const raw = match[1].replace(/[.,;:!?]+$/, "");
     facets.push({
-      index: { byteStart: match.index, byteEnd: match.index + match[0].length },
-      features: [{ $type: "app.bsky.richtext.facet#link", uri: match[1] }],
+      index: utf8ByteSpan(text, match.index, raw.length),
+      features: [{ $type: "app.bsky.richtext.facet#link", uri: raw }],
     });
   }
 
@@ -38,7 +45,7 @@ function detectFacets(text: string): Facet[] {
   const tagRe = /#[^\s!@#$%^&*()=+./,[{\]};:'"?><]+/g;
   while ((match = tagRe.exec(text)) !== null) {
     facets.push({
-      index: { byteStart: match.index, byteEnd: match.index + match[0].length },
+      index: utf8ByteSpan(text, match.index, match[0].length),
       features: [{ $type: "app.bsky.richtext.facet#tag", tag: match[0].slice(1) }],
     });
   }
@@ -380,6 +387,72 @@ function createServer(): McpServer {
       });
       return {
         content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+      };
+    }
+  );
+
+  server.tool(
+    "bluesky_thread",
+    "Create a chained multipost thread on Bluesky (e.g. ELI5 educational kata threads with GitHub links). Automatically detects rich-text link/tag/mention facets and chains root/parent AT-URIs.",
+    {
+      posts: z.array(z.string().max(300)).min(1).max(25).describe("Ordered array of post texts (each <= 300 chars/graphemes)"),
+    },
+    async ({ posts }) => {
+      const session = await client.getSession();
+      const published: Array<{ index: number; uri: string; cid: string; url: string; text: string }> = [];
+      let rootRef: { uri: string; cid: string } | null = null;
+      let parentRef: { uri: string; cid: string } | null = null;
+
+      for (let i = 0; i < posts.length; i++) {
+        const text = posts[i];
+        const facets = detectFacets(text);
+        const record: Record<string, unknown> = {
+          $type: "app.bsky.feed.post",
+          text,
+          createdAt: new Date(Date.now() + i * 50).toISOString(),
+        };
+        if (facets.length > 0) {
+          record.facets = facets;
+        }
+        if (rootRef && parentRef) {
+          record.reply = {
+            root: rootRef,
+            parent: parentRef,
+          };
+        }
+
+        const created = await client.post<{ uri: string; cid: string }>("com.atproto.repo.createRecord", {
+          repo: session.did,
+          collection: "app.bsky.feed.post",
+          record,
+        });
+
+        const ref = { uri: created.uri, cid: created.cid };
+        if (!rootRef) {
+          rootRef = ref;
+        }
+        parentRef = ref;
+        const rkey = created.uri.split("/").pop() || "";
+        published.push({
+          index: i + 1,
+          uri: created.uri,
+          cid: created.cid,
+          url: `https://bsky.app/profile/${session.handle}/post/${rkey}`,
+          text,
+        });
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            handle: session.handle,
+            did: session.did,
+            count: published.length,
+            rootUrl: published[0]?.url,
+            posts: published,
+          }, null, 2),
+        }],
       };
     }
   );
